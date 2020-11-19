@@ -16,7 +16,7 @@ from mmdet.core import encode_mask_results
 def single_gpu_test(model,
                     data_loader,
                     postprocessor,
-                    csvPath,
+                    csvPath = None,
                     show=False,
                     out_dir=None,
                     show_score_thr=0.3,
@@ -25,19 +25,20 @@ def single_gpu_test(model,
     results = []
     dataset = data_loader.dataset
     noResultsFiles = []
-    cascadecsv = open(csvPath, 'w')
-    cascadecsv.write("file_name,c1,c2,c3,c4,c5,c6,c7 \n")
+    if csvPath is not None:
+        cascadecsv = open(csvPath, 'w')
+        cascadecsv.write("file_name,c1,c2,c3,c4,c5,c6,c7 \n")
 
     prog_bar = mmcv.ProgressBar(len(dataset))
     for i, data in enumerate(data_loader):
-        # print('data : ', type(data), len(data), data)
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
 
         img_meta = data['img_metas'][0].data[0][0]
         file_path = img_meta['ori_filename']
-        postprocessor.saveScorechecker(file_path, result[0], cascadecsv)
         labels = postprocessor.saveIitp(file_path, result[0])
+        if csvPath is not None:
+            postprocessor.saveScorechecker(file_path, result[0], cascadecsv)
         if labels is False:
             noResultsFiles.append(file_path)
             
@@ -46,47 +47,6 @@ def single_gpu_test(model,
             prog_bar.update()
 
     return noResultsFiles
-    #     batch_size = len(result)
-    #     # print('batch_size : ', batch_size)
-    #     # print('result : ', len(result[0]), result)
-    #     # print()
-    #     if show or out_dir:
-    #         if batch_size == 1 and isinstance(data['img'][0], torch.Tensor):
-    #             img_tensor = data['img'][0]
-    #         else:
-    #             img_tensor = data['img'][0].data[0]
-    #         img_metas = data['img_metas'][0].data[0]
-    #         imgs = tensor2imgs(img_tensor, **img_metas[0]['img_norm_cfg'])
-    #         assert len(imgs) == len(img_metas)
-
-    #         for i, (img, img_meta) in enumerate(zip(imgs, img_metas)):
-    #             h, w, _ = img_meta['img_shape']
-    #             img_show = img[:h, :w, :]
-
-    #             ori_h, ori_w = img_meta['ori_shape'][:-1]
-    #             img_show = mmcv.imresize(img_show, (ori_w, ori_h))
-
-    #             if out_dir:
-    #                 out_file = osp.join(out_dir, img_meta['ori_filename'])
-    #             else:
-    #                 out_file = None
-
-    #             model.module.show_result(
-    #                 img_show,
-    #                 result[i],
-    #                 show=show,
-    #                 out_file=out_file,
-    #                 score_thr=show_score_thr)
-
-    #     # encode mask results
-    #     if isinstance(result[0], tuple):
-    #         result = [(bbox_results, encode_mask_results(mask_results))
-    #                   for bbox_results, mask_results in result]
-    #     results.extend(result)
-
-    #     for _ in range(batch_size):
-    #         prog_bar.update()
-    # return results
 
 
 def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
