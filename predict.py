@@ -1,225 +1,264 @@
-import argparse
-import os
-import warnings
-import sys
+from os import path, listdir
+from argparse import ArgumentParser
 import json
+from tqdm import tqdm
+import re
 
-import mmcv
-import torch
+from torchvision.transforms.functional import center_crop, hflip
+from mmdet.apis import inference_detector, init_detector, show_result_pyplot
 
-from mmcv import Config, DictAction
-from mmcv.cnn import fuse_conv_bn
-from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
-                         wrap_fp16_model)
-
-from test_utils import PostProcessor
-
-# sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from mmdet.apis import multi_gpu_test, single_gpu_test
-from mmdet.datasets import (build_dataloader, build_dataset,
-                            replace_ImageToTensor)
-from mmdet.datasets.inference_dataset import batch_infer_dataset
-from mmdet.models import build_detector
+# from ELC import inference as elc
+from predict_utils import PostProcessor
+from PIL import Image
+import numpy as np
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='MMDet test (and eval) a model')
-    parser.add_argument('data_dir', help='inference images path')
-
-    parser.add_argument('--score_check', default=False, help='score check')
-    parser.add_argument('--config', default='./config.py', help='test config file path')
-    parser.add_argument('--checkpoint', default='./epoch.pth', help='checkpoint file')
-    parser.add_argument('--out', help='output result file in pickle format')
-    parser.add_argument(
-        '--fuse-conv-bn',
-        action='store_true',
-        help='Whether to fuse conv and bn, this will slightly increase'
-        'the inference speed')
-    parser.add_argument(
-        '--format-only',
-        action='store_true',
-        help='Format the output results without perform evaluation. It is'
-        'useful when you want to format the result to a specific format and '
-        'submit it to the test server')
-    parser.add_argument(
-        '--eval',
-        type=str,
-        nargs='+',
-        help='evaluation metrics, which depends on the dataset, e.g., "bbox",'
-        ' "segm", "proposal" for COCO, and "mAP", "recall" for PASCAL VOC')
-    parser.add_argument('--show', action='store_true', help='show results')
-    parser.add_argument(
-        '--show-dir', default='../results/', help='directory where painted images will be saved')
-    parser.add_argument(
-        '--show-score-thr',
-        type=float,
-        default=0.5,
-        help='score threshold (default: 0.3)')
-    parser.add_argument(
-        '--gpu-collect',
-        action='store_true',
-        help='whether to use gpu to collect results.')
-    parser.add_argument(
-        '--tmpdir',
-        help='tmp directory used for collecting results from multiple '
-        'workers, available when gpu-collect is not specified')
-    parser.add_argument(
-        '--cfg-options',
-        nargs='+',
-        action=DictAction,
-        help='override some settings in the used config, the key-value pair '
-        'in xxx=yyy format will be merged into config file.')
-    parser.add_argument(
-        '--options',
-        nargs='+',
-        action=DictAction,
-        help='custom options for evaluation, the key-value pair in xxx=yyy '
-        'format will be kwargs for dataset.evaluate() function (deprecate), '
-        'change to --eval-options instead.')
-    parser.add_argument(
-        '--eval-options',
-        nargs='+',
-        action=DictAction,
-        help='custom options for evaluation, the key-value pair in xxx=yyy '
-        'format will be kwargs for dataset.evaluate() function')
-    parser.add_argument(
-        '--launcher',
-        choices=['none', 'pytorch', 'slurm', 'mpi'],
-        default='none',
-        help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
-    args = parser.parse_args()
-    if 'LOCAL_RANK' not in os.environ:
-        os.environ['LOCAL_RANK'] = str(args.local_rank)
-
-    if args.options and args.eval_options:
-        raise ValueError(
-            '--options and --eval-options cannot be both '
-            'specified, --options is deprecated in favor of --eval-options')
-    if args.options:
-        warnings.warn('--options is deprecated in favor of --eval-options')
-        args.eval_options = args.options
-    return args
+NO_RESULT_CLASS = 6 # plastic
+STANDARD_HEIGHT = 720
+STANDARD_WIDTH = 1280
+CENTER_CROP_RATIO = 0.8
 
 
-def main():
-    args = parse_args()
+def makeImgList(dir):
+    imgFileNames = listdir(dir)
+    imgFileNames = [x for x in imgFileNames if x.endswith(('jpg', 'JPG', 'jpeg', 'JPEG'))]
+    imgFileNames = [path.join(dir, x) for x in imgFileNames]
 
-    assert args.out or args.eval or args.format_only or args.show \
-        or args.show_dir, \
-        ('Please specify at least one operation (save/eval/format/show the '
-         'results / save the results) with the argument "--out", "--eval"'
-         ', "--format-only", "--show" or "--show-dir"')
+    return imgFileNames
 
-    if args.eval and args.format_only:
-        raise ValueError('--eval and --format_only cannot be both specified')
+def sorted_aphanumeric(data):
+    convert = lambda text: int(text) if text.isdigit() else text.lower()
+    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
+    return sorted(data, key=alphanum_key)
 
-    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
-        raise ValueError('The output file must be a pkl file.')
+def savePathFromImgPath(save_dir, imgPath):
+    return path.join(save_dir, imgPath.split('/')[-1])
 
-    cfg = Config.fromfile(args.config)
-    if args.cfg_options is not None:
-        cfg.merge_from_dict(args.cfg_options)
-    # import modules from string list.
-    if cfg.get('custom_imports', None):
-        from mmcv.utils import import_modules_from_strings
-        import_modules_from_strings(**cfg['custom_imports'])
-    # set cudnn_benchmark
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
-    cfg.model.pretrained = None
-    if cfg.model.get('neck'):
-        if isinstance(cfg.model.neck, list):
-            for neck_cfg in cfg.model.neck:
-                if neck_cfg.get('rfp_backbone'):
-                    if neck_cfg.rfp_backbone.get('pretrained'):
-                        neck_cfg.rfp_backbone.pretrained = None
-        elif cfg.model.neck.get('rfp_backbone'):
-            if cfg.model.neck.rfp_backbone.get('pretrained'):
-                cfg.model.neck.rfp_backbone.pretrained = None
+def _pillow2array(img, flag='color', channel_order='bgr'):
+    """Convert a pillow image to numpy array.
 
-    # in case the test dataset is concatenated
-    if isinstance(cfg.data.test, dict):
-        cfg.data.test.test_mode = True
-    elif isinstance(cfg.data.test, list):
-        for ds_cfg in cfg.data.test:
-            ds_cfg.test_mode = True
+    Args:
+        img (:obj:`PIL.Image.Image`): The image loaded using PIL
+        flag (str): Flags specifying the color type of a loaded image,
+            candidates are 'color', 'grayscale' and 'unchanged'.
+            Default to 'color'.
+        channel_order (str): The channel order of the output image array,
+            candidates are 'bgr' and 'rgb'. Default to 'bgr'.
 
-    # init distributed env first, since logger depends on the dist info.
-    if args.launcher == 'none':
-        distributed = False
+    Returns:
+        np.ndarray: The converted numpy array
+    """
+    channel_order = channel_order.lower()
+    if channel_order not in ['rgb', 'bgr']:
+        raise ValueError('channel order must be either "rgb" or "bgr"')
+
+    if flag == 'unchanged':
+        array = np.array(img)
+        if array.ndim >= 3 and array.shape[2] >= 3:  # color image
+            array[:, :, :3] = array[:, :, (2, 1, 0)]  # RGB to BGR
     else:
-        distributed = True
-        init_dist(args.launcher, **cfg.dist_params)
+        # If the image mode is not 'RGB', convert it to 'RGB' first.
+        if img.mode != 'RGB':
+            if img.mode != 'LA':
+                # Most formats except 'LA' can be directly converted to RGB
+                img = img.convert('RGB')
+            else:
+                # When the mode is 'LA', the default conversion will fill in
+                #  the canvas with black, which sometimes shadows black objects
+                #  in the foreground.
+                #
+                # Therefore, a random color (124, 117, 104) is used for canvas
+                img_rgba = img.convert('RGBA')
+                img = Image.new('RGB', img_rgba.size, (124, 117, 104))
+                img.paste(img_rgba, mask=img_rgba.split()[3])  # 3 is alpha
+        if flag == 'color':
+            array = np.array(img)
+            if channel_order != 'rgb':
+                array = array[:, :, ::-1]  # RGB to BGR
+        elif flag == 'grayscale':
+            img = img.convert('L')
+            array = np.array(img)
+        else:
+            raise ValueError(
+                'flag must be "color", "grayscale" or "unchanged", '
+                f'but got {flag}')
+    return array
 
-    # build the dataloader
-    samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
-    print('samples_per_gpu : ', samples_per_gpu)
-    if samples_per_gpu > 1:
-        # Replace 'ImageToTensor' to 'DefaultFormatBundle'
-        cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
+def imgPairSingle(imgPath, hflipBool=False):
+    img = Image.open(imgPath)
+    if img.width < img.height:
+        img = img.transpose(Image.ROTATE_90)
+    if hflipBool:
+        img = hflip(img)
+    # if centerCrop or (img.width > STANDARD_WIDTH and img.height > STANDARD_HEIGHT):
+    #     cropHeight = int(img.height * CENTER_CROP_RATIO)
+    #     cropWidth = int(img.width * CENTER_CROP_RATIO)
+    #     img = center_crop(img, (cropHeight, cropWidth))
+    img = _pillow2array(img, flag='color', channel_order='bgr')
     
-    cfg.data.test.pipeline[0].type = 'LoadImageFromWebcam'
-    print('cfg.data.test.pipeline : ', cfg.data.test.pipeline)
+    return  imgPath, img
 
-    dataset = batch_infer_dataset(args.data_dir, cfg)
-    data_loader = build_dataloader(
-        dataset,
-        samples_per_gpu=samples_per_gpu,
-        workers_per_gpu=cfg.data.workers_per_gpu,
-        dist=distributed,
-        shuffle=False)
+def imgPairList(imgFileNames):
+    for imgPath in imgFileNames:
+        yield imgPairSingle(imgPath)
 
-    # build the model and load checkpoint
-    model = build_detector(cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)
-    fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
-        wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
-    if args.fuse_conv_bn:
-        model = fuse_conv_bn(model)
-    # old versions did not save class info in checkpoints, this walkaround is
-    # for backward compatibility
-    if 'CLASSES' in checkpoint['meta']:
-        model.CLASSES = checkpoint['meta']['CLASSES']
-    else:
-        model.CLASSES = dataset.CLASSES
+def inference(detectorsModel, detectorsPostProcessor, KEY_OBJECT, imgList, SCORE_CHECKER, SAVE_DIR):
+    if SCORE_CHECKER:
+        f = open("no_key_object.csv", 'w')
+        f.write("file_name,c1,c2,c3,c4,c5,c6,c7 \n")
 
-    postprocessor = PostProcessor(classes=model.CLASSES, score_thr=args.show_score_thr)
+    labelSum = [0] * 8
+    nonResultImgPath = []
+    for imgPath, img in tqdm(imgPairList(imgList)):
+        result = inference_detector(detectorsModel, img)
+        if not KEY_OBJECT:
+            # detectorsPostProcessor.saveResult(img, result, show=False, out_file=savePathFromImgPath(SAVE_DIR, imgPath))
+            nowLabels = detectorsPostProcessor.saveIitp(img, imgPath, result)
+            if isinstance(nowLabels, list):
+                # case : true => labels list
+                for label in nowLabels:
+                    labelSum[label] += 1
+            else:
+                # case : false
+                imgPath, img = imgPairSingle(imgPath, hflipBool=True)
+                result = inference_detector(detectorsModel, img)
+                nowLabels = detectorsPostProcessor.saveIitp(img, imgPath, result)
+                if isinstance(nowLabels, list):
+                    # case : true => labels list
+                    for label in nowLabels:
+                        labelSum[label] += 1
+                else:
+                    nonResultImgPath.append(imgPath)
+            if SCORE_CHECKER:
+                # our score checker
+                _, labels = detectorsPostProcessor.cropBoxes(img, result, out_file=None)
+                output_class = [0] * 8
+                f.write(imgPath.split("/")[-1])
+                for label in labels:
+                    output_class[label] = 1
+                output_class.pop(0)
+                for i in output_class:
+                    f.write("," + str(i))
+                f.write("," + "\n")
+        else:
+            label_class = [0, 1, 1, 2, 3, 4, 5, 6, 5, 6]
+            output_class = [0, 0, 0, 0, 0, 0, 0]
+            keypointLabes = []
+            keypointBoxes = []
+            labels, p = detectorsPostProcessor.get_key_object(imgPath, result, out_file=None)
+            for idxx in p:
+                if int(idxx.size()) > 1:
+                    for idxxx in range(0, int(idxx.size())):
+                        if idxx.selectNode(idxxx).data[5] == 8:
+                            if 3 in idxx.selectNode(0).data or 4 in idxx.selectNode(0).data:
+                                idxx.selectNode(idxxx).data[5] = 3
+                        elif idxx.selectNode(idxxx).data[5] == 9:
+                            if 3 in idxx.selectNode(0).data:
+                                idxx.selectNode(idxxx).data[5] = 3
+                            elif 4 in idxx.selectNode(0).data:
+                                idxx.selectNode(idxxx).data[5] = 0
+                        label = label_class[idxx.selectNode(idxxx).data[5]]
+                        keypointLabes.append(label+1)
+                        keypointBoxes.append([int(idxx.selectNode(idxxx).data[0]), int(idxx.selectNode(idxxx).data[1]), int(idxx.selectNode(idxxx).data[2]), int(idxx.selectNode(idxxx).data[3])])
+                        output_class[label] = 1
+                        detectorsPostProcessor.annoMaker(imgPath, keypointBoxes, keypointLabes, labelChanger=False)
+                elif int(idxx.size()) == 1:
+                    for i in labels:
+                        if i == 8:
+                            if 3 in labels or 4 in labels:
+                                i = 3
+                        if i == 9:
+                            if 3 in labels:
+                                i = 3
+                            elif 4 in labels:
+                                i = 0
+                        label = label_class[i]
+                        output_class[label] = 1
+                        detectorsPostProcessor.annoMaker(imgPath, [[100,200,300,400]], [label+1], labelChanger=False)
+                else:
+                    print('no result twice')
+                    # no results
+                    # output_class[NO_RESULT_CLASS-1] = 1
+                    imgPath, img = imgPairSingle(imgPath, hflipBool=True)
+                    result = inference_detector(detectorsModel, img)
 
-    csvPath = None
-    if args.score_check:
-        csvPath = './cascade.csv'
-    NO_RESULT_CLASS = 6
+                    output_class = [0, 0, 0, 0, 0, 0, 0]
+                    keypointLabes = []
+                    keypointBoxes = []
+                    labels, p = detectorsPostProcessor.get_key_object(imgPath, result, out_file=None)
+                    for idxx in p:
+                        if int(idxx.size()) > 1:
+                            for idxxx in range(0, int(idxx.size())):
+                                if idxx.selectNode(idxxx).data[5] == 8:
+                                    if 3 in idxx.selectNode(0).data or 4 in idxx.selectNode(0).data:
+                                        idxx.selectNode(idxxx).data[5] = 3
+                                elif idxx.selectNode(idxxx).data[5] == 9:
+                                    if 3 in idxx.selectNode(0).data:
+                                        idxx.selectNode(idxxx).data[5] = 3
+                                    elif 4 in idxx.selectNode(0).data:
+                                        idxx.selectNode(idxxx).data[5] = 0
+                                label = label_class[idxx.selectNode(idxxx).data[5]]
+                                keypointLabes.append(label+1)
+                                keypointBoxes.append([int(idxx.selectNode(idxxx).data[0]), int(idxx.selectNode(idxxx).data[1]), int(idxx.selectNode(idxxx).data[2]), int(idxx.selectNode(idxxx).data[3])])
+                                output_class[label] = 1
+                                detectorsPostProcessor.annoMaker(imgPath, keypointBoxes, keypointLabes, labelChanger=False)
+                        elif int(idxx.size()) == 1:
+                            for i in labels:
+                                if i == 8:
+                                    if 3 in labels or 4 in labels:
+                                        i = 3
+                                if i == 9:
+                                    if 3 in labels:
+                                        i = 3
+                                    elif 4 in labels:
+                                        i = 0
+                                label = label_class[i]
+                                output_class[label] = 1
+                                detectorsPostProcessor.annoMaker(imgPath, [[100,200,300,400]], [label+1], labelChanger=False)
+                        else:
+                            output_class[NO_RESULT_CLASS-1] = 1
+                            nonResultImgPath.append(imgPath)
 
-    if not distributed:
-        model = MMDataParallel(model, device_ids=[0])
-        noResultsFiles = single_gpu_test(model, data_loader, postprocessor, csvPath, args.show, args.show_dir,
-                                  args.show_score_thr)
-        if len(noResultsFiles) > 0:
-            dataset = batch_infer_dataset(args.data_dir, cfg)
-            data_loader = build_dataloader(
-                dataset,
-                samples_per_gpu=samples_per_gpu,
-                workers_per_gpu=cfg.data.workers_per_gpu,
-                dist=distributed,
-                shuffle=False)
-            noResultsFiles = single_gpu_test(model, data_loader, postprocessor, csvPath, args.show, args.show_dir,
-                                    args.show_score_thr)
-            for imgPath in noResultsFiles:
-                postprocessor.annoMaker(imgPath, [[100,200,300,400]], [NO_RESULT_CLASS])
-    else:
-        model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False)
-        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
-                                 args.gpu_collect)
+            if SCORE_CHECKER:
+                # our score checker
+                f.write(imgPath.split("/")[-1])
+                for i in output_class:
+                    f.write("," + str(i))
+                f.write("," + "\n")
+
+    for imgPath in nonResultImgPath:
+        detectorsPostProcessor.annoMaker(imgPath, [[100,200,300,400]], [NO_RESULT_CLASS], labelChanger=False)
 
     with open('./t3_res_0022.json', 'w') as jsonFile:
-        json.dump(postprocessor.iitpJson, jsonFile)
+        json.dump(detectorsPostProcessor.iitpJson, jsonFile)
+
+def main():
+    # DetectoRS options
+    parser = ArgumentParser()
+    parser.add_argument('img_dir', help='Image files path')
+    parser.add_argument('--config', default='/aichallenge/config.py')
+    parser.add_argument('--checkpoint', default='/aichallenge/epoch.pth')
+    # parser.add_argument('--config', default="/home/ubuntu/minseok/mmdetection/work_dirs/20201205_detectors_r50_seperateCanLabel_MST/2020_1205_detectors_cascade_rcnn_r50_1x_coco_MST.py")
+    # parser.add_argument('--checkpoint', default="/home/ubuntu/minseok/mmdetection/work_dirs/20201205_detectors_r50_seperateCanLabel_MST/only_weights_epoch_26.pth")
+
+    parser.add_argument('--save_dir', default='./results')
+    parser.add_argument('--threshold', default=0.46)
+    parser.add_argument('--score_checker', default=True)
+    parser.add_argument('--devices', default='cuda:0')
+    parser.add_argument('--key_object', default=False)
+    args = parser.parse_args()
+
+    # load image list
+    imgList = sorted_aphanumeric(makeImgList(args.img_dir))
+    # build DetectoRS
+    detectorsModel = init_detector(args.config, args.checkpoint, device=args.devices)
+    # detectorsModel.CLASSES = ('paper', 'paperpack', 'papercup', 'can', 'bottle', 'pet', 'plastic', 'vinyl', 'cap', 'label')
+    detectorsModel.CLASSES = ('paper', 'paperpack', 'papercup', 'can', 'bottle', 'pet', 'plastic', 'vinyl', 'cap_can', 'cap_plastic', 'label_paper', 'label_vinyl')
+    print('detectorsModel.CLASSES : ', detectorsModel.CLASSES)
+    detectorsPostProcessor = PostProcessor(detectorsModel.CLASSES, score_thr=args.threshold)
+
+    inference(detectorsModel, detectorsPostProcessor, args.key_object, imgList, args.score_checker, args.save_dir)
+
 
 if __name__ == '__main__':
     main()

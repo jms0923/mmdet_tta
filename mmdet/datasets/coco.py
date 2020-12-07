@@ -28,7 +28,8 @@ except AssertionError:
 @DATASETS.register_module()
 class CocoDataset(CustomDataset):
 
-    CLASSES = ('paper','paperpack','papercup','can','bottle','pet','plastic','vinyl','cap','label')
+    # CLASSES = ('paper','paperpack','papercup','can','bottle','pet','plastic','vinyl','cap','label')
+    CLASSES = ('paper','paperpack','papercup','can','bottle','pet','plastic','vinyl','label','cap_can','cap_plastic')
 
     def load_annotations(self, ann_file):
         """Load annotation from COCO style annotation file.

@@ -5,7 +5,7 @@ from PIL import Image
 
 import torch
 from torch.utils.data import Dataset
-from torchvision.transforms.functional import center_crop
+from torchvision.transforms.functional import center_crop, hflip, rotate
 
 # from torch.utils.data.dataset import T_co
 from mmdet.datasets.pipelines import Compose
@@ -69,6 +69,7 @@ class batch_infer_dataset(Dataset):
         self.root_dir = root_dir
         self.cfg = cfg
         self.cfg.data.test.pipeline[0].type = 'LoadImageFromWebcam'
+        self.first_crop = 0.95
         self.twice = False
         if img_list is None:
             self.img_list = self._get_img_list()
@@ -97,10 +98,17 @@ class batch_infer_dataset(Dataset):
 
         if img.width < img.height:
             img = img.transpose(Image.ROTATE_90)
+        # if self.twice == False:
+        #     cropHeight = int(img.height * self.first_crop)
+        #     cropWidth = int(img.width * self.first_crop)
+        #     img = center_crop(img, (cropHeight, cropWidth))
         if self.twice or (img.width > self.STANDARD_WIDTH and img.height > self.STANDARD_HEIGHT):
             cropHeight = int(img.height * self.CENTER_CROP_RATIO)
             cropWidth = int(img.width * self.CENTER_CROP_RATIO)
             img = center_crop(img, (cropHeight, cropWidth))
+        
+        # img = hflip(img)
+        # img = rotate(img, 180)
         img = _pillow2array(img)
 
         data = dict(img=img)
